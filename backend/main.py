@@ -22,7 +22,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-luna")
+# Use a real API model by default. It supports image input through the Responses API.
+MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 UPLOAD_DIR = Path(tempfile.gettempdir()) / "ai-legal-analyzer"
 UPLOAD_DIR.mkdir(exist_ok=True)
 
@@ -35,7 +36,13 @@ def get_client():
 
 
 def image_data_url(path: Path) -> str:
-    mime = "image/jpeg" if path.suffix.lower() in {".jpg", ".jpeg"} else "image/png"
+    suffix = path.suffix.lower()
+    mime = {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+    }.get(suffix, "image/jpeg")
     encoded = base64.b64encode(path.read_bytes()).decode("utf-8")
     return f"data:{mime};base64,{encoded}"
 
@@ -47,7 +54,6 @@ def extract_video_frames(video_path: Path, max_frames: int = 6) -> list[Path]:
 
     total = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = capture.get(cv2.CAP_PROP_FPS) or 25
-    duration = total / fps if total else 0
     count = min(max_frames, max(1, total))
     positions = [int(i * max(total - 1, 0) / max(count - 1, 1)) for i in range(count)]
     paths = []
@@ -100,34 +106,34 @@ async def analyze_case(
         raise HTTPException(status_code=400, detail="Please upload at most 8 evidence files")
 
     client = get_client()
-    saved_images: list[Path] = []
+    saved_files: list[Path] = []
     all_frames: list[Path] = []
     evidence_labels: list[str] = []
 
     try:
-        for upload in evidence:
+        for index, upload in enumerate(evidence):
             suffix = Path(upload.filename or "evidence").suffix.lower()
             allowed = {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov", ".avi", ".mkv"}
             if suffix not in allowed:
                 raise HTTPException(status_code=400, detail=f"Unsupported file type: {suffix}")
 
-            path = UPLOAD_DIR / f"upload_{os.getpid()}_{len(saved_images)}{suffix}"
+            path = UPLOAD_DIR / f"upload_{os.getpid()}_{index}{suffix}"
             with path.open("wb") as buffer:
                 shutil.copyfileobj(upload.file, buffer)
+            saved_files.append(path)
 
             if suffix in {".jpg", ".jpeg", ".png", ".webp"}:
-                saved_images.append(path)
                 evidence_labels.append(upload.filename or "image")
             else:
                 frames = extract_video_frames(path)
                 all_frames.extend(frames)
                 evidence_labels.append(f"{upload.filename or 'video'} ({len(frames)} representative frames)")
 
-        visual_paths = saved_images + all_frames
-        content = [
-            {
-                "type": "input_text",
-                "text": f"""
+        visual_paths = [p for p in saved_files if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}] + all_frames
+
+        content = [{
+            "type": "input_text",
+            "text": f"""
 You are an evidence-grounded legal case analysis assistant for a hackathon demo.
 
 USER'S DESCRIPTION:
@@ -149,20 +155,25 @@ Return ONLY valid JSON with this exact structure:
   "next_steps": ["practical evidence-preservation or information-gathering step"],
   "disclaimer": "This is an AI-assisted assessment, not legal advice or a prediction of a court outcome."
 }}
-""",
-            }
-        ]
+"""
+        }]
 
         for image_path in visual_paths[:8]:
             content.append({"type": "input_image", "image_url": image_data_url(image_path)})
 
-        response = client.responses.create(model=MODEL, input=[{"role": "user", "content": content}])
+        response = client.responses.create(
+            model=MODEL,
+            input=[{"role": "user", "content": content}],
+        )
         result = parse_json(response.output_text)
         result["evidence_files"] = evidence_labels
         return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"AI analysis failed: {exc}") from exc
     finally:
-        for path in saved_images + all_frames:
+        for path in saved_files + all_frames:
             path.unlink(missing_ok=True)
-
         for upload in evidence:
-            pass
+            await upload.close()
